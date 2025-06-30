@@ -663,7 +663,8 @@ class Attention(nn.Module):
         hidden_states: torch.FloatTensor,
         freqs_cis: Optional[Tuple[torch.FloatTensor, torch.FloatTensor]] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
+        hidden_states_segment_ids: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states_segment_ids: Optional[torch.FloatTensor] = None,
         skip_layer_mask: Optional[torch.Tensor] = None,
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
         **cross_attention_kwargs,
@@ -676,8 +677,10 @@ class Attention(nn.Module):
                 The hidden states of the query.
             encoder_hidden_states (`torch.Tensor`, *optional*):
                 The hidden states of the encoder.
-            attention_mask (`torch.Tensor`, *optional*):
-                The attention mask to use. If `None`, no mask is applied.
+            hidden_states_segment_ids (`torch.Tensor`, *optional*):
+                The attention mask to use for queries. If `None`, no mask is applied.
+            encoder_hidden_states_segment_ids (`torch.Tensor`, *optional*):
+                The attention mask to use for kv. If `None`, no mask is applied.
             skip_layer_mask (`torch.Tensor`, *optional*):
                 The skip layer mask to use. If `None`, no mask is applied.
             skip_layer_strategy (`SkipLayerStrategy`, *optional*, defaults to `None`):
@@ -712,7 +715,8 @@ class Attention(nn.Module):
             hidden_states,
             freqs_cis=freqs_cis,
             encoder_hidden_states=encoder_hidden_states,
-            attention_mask=attention_mask,
+            hidden_states_segment_ids=hidden_states_segment_ids,
+            encoder_hidden_states_segment_ids=encoder_hidden_states_segment_ids,
             skip_layer_mask=skip_layer_mask,
             skip_layer_strategy=skip_layer_strategy,
             **cross_attention_kwargs,
@@ -825,7 +829,8 @@ class Attention(nn.Module):
 
     def prepare_attention_mask(
         self,
-        attention_mask: torch.Tensor,
+        kv_segment_ids: torch.Tensor,
+        q_segment_ids:  torch.Tensor,
         target_length: int,
         batch_size: int,
         out_dim: int = 3,
@@ -834,8 +839,10 @@ class Attention(nn.Module):
         Prepare the attention mask for the attention computation.
 
         Args:
-            attention_mask (`torch.Tensor`):
-                The attention mask to prepare.
+            kv_segment_ids (`torch.Tensor`):
+                The segment Ids for the KV cache.
+            q_segment_ids (`torch.Tensor`):
+                The Segment Ids for the Queries.
             target_length (`int`):
                 The target length of the attention mask. This is the length of the attention mask after padding.
             batch_size (`int`):
@@ -847,40 +854,32 @@ class Attention(nn.Module):
             `torch.Tensor`: The prepared attention mask.
         """
         head_size = self.heads
-        if attention_mask is None:
-            return attention_mask
+        if kv_segment_ids is None and q_segment_ids is None:
+            return None
+        
+        if (kv_segment_ids is None) ^ (q_segment_ids is None):
+            raise ValueError("Provide both segment-ID tensors or neither.")
+        
+        kv_pad = kv_segment_ids == 0
+        q_pad = q_segment_ids == 0
 
-        current_length: int = attention_mask.shape[-1]
-        if current_length != target_length:
-            if attention_mask.device.type == "mps":
-                # HACK: MPS: Does not support padding by greater than dimension of input tensor.
-                # Instead, we can manually construct the padding tensor.
-                padding_shape = (
-                    attention_mask.shape[0],
-                    attention_mask.shape[1],
-                    target_length,
-                )
-                padding = torch.zeros(
-                    padding_shape,
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
-                )
-                attention_mask = torch.cat([attention_mask, padding], dim=2)
-            else:
-                # TODO: for pipelines such as stable-diffusion, padding cross-attn mask:
-                #       we want to instead pad by (0, remaining_length), where remaining_length is:
-                #       remaining_length: int = target_length - current_length
-                # TODO: re-enable tests/models/test_models_unet_2d_condition.py#test_model_xattn_padding
-                attention_mask = F.pad(attention_mask, (0, target_length), value=0.0)
+        mask_bool = (
+            (q_segment_ids.unsqueeze(-1) != kv_segment_ids.unsqueeze(-1)) |
+            (q_pad.unsqueeze(-1) | kv_pad.unsqueeze(-1))
+        )
+
+        # used chatgpt for this
+        additive_mask = torch.zeros_like(mask_bool, dtype=torch.float32)
+        addive_mask.masked_fill_(mask_bool, float("-inf"))
 
         if out_dim == 3:
-            if attention_mask.shape[0] < batch_size * head_size:
-                attention_mask = attention_mask.repeat_interleave(head_size, dim=0)
-        elif out_dim == 4:
-            attention_mask = attention_mask.unsqueeze(1)
-            attention_mask = attention_mask.repeat_interleave(head_size, dim=1)
-
-        return attention_mask
+            additive_mask = additive_mask.repeat_interleave(H, dim=0) # B*H
+        if out_dim == 4:
+            additive_mask = additive_mask.upsqueeze(1).repeat_interleave(H, dim=1) # H is second dimension
+        else:
+            raise ValueError("out_dim must be 3 or 4")
+        
+        return additive_mask
 
     def norm_encoder_hidden_states(
         self, encoder_hidden_states: torch.Tensor
@@ -947,7 +946,8 @@ class AttnProcessor2_0:
         hidden_states: torch.FloatTensor,
         freqs_cis: Tuple[torch.FloatTensor, torch.FloatTensor],
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states_segment_ids: Optional[torch.FloatTensor] = None,
+        hidden_states_segment_ids: Optional[torch.FloatTensor] = None,
         temb: Optional[torch.FloatTensor] = None,
         skip_layer_mask: Optional[torch.FloatTensor] = None,
         skip_layer_strategy: Optional[SkipLayerStrategy] = None,
@@ -979,14 +979,13 @@ class AttnProcessor2_0:
         if skip_layer_mask is not None:
             skip_layer_mask = skip_layer_mask.reshape(batch_size, 1, 1)
 
-        if (attention_mask is not None) and (not attn.use_tpu_flash_attention):
+        attention_mask = None
+
+        assert (encoder_hidden_states_segment_ids is None) ^ (hidden_states_segment_ids is not None), "Either encoder_hidden_states_segment_ids and hidden_states_segment_ids are both None (for full attention) and both aren't none (for segmented attention)"
+
+        if encoder_hidden_states_segment_ids is not None and hidden_states_segment_ids is not None:
             attention_mask = attn.prepare_attention_mask(
-                attention_mask, sequence_length, batch_size
-            )
-            # scaled_dot_product_attention expects attention_mask shape to be
-            # (batch, heads, source_length, target_length)
-            attention_mask = attention_mask.view(
-                batch_size, attn.heads, -1, attention_mask.shape[-1]
+                kv_segment_ids=encoder_hidden_states_segment_ids, q_segment_ids=hidden_states_segment_ids, target_length=sequence_length, batch_size=batch_size,
             )
 
         if attn.group_norm is not None:
@@ -1025,18 +1024,19 @@ class AttnProcessor2_0:
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
 
         if attn.use_tpu_flash_attention:  # use tpu attention offload 'flash attention'
-            q_segment_indexes = None
-            if (
-                attention_mask is not None
-            ):  # if mask is required need to tune both segmenIds fields
-                # attention_mask = torch.squeeze(attention_mask).to(torch.float32)
-                attention_mask = attention_mask.to(torch.float32)
-                q_segment_indexes = torch.ones(
-                    batch_size, query.shape[2], device=query.device, dtype=torch.float32
-                )
-                assert (
-                    attention_mask.shape[1] == key.shape[2]
-                ), f"ERROR: KEY SHAPE must be same as attention mask [{key.shape[2]}, {attention_mask.shape[1]}]"
+        #     q_segment_indexes = None
+        #     if (
+        #         attention_mask is not None
+        #     ):  # if mask is required need to tune both segmenIds fields
+        #         # attention_mask = torch.squeeze(attention_mask).to(torch.float32)
+        #         attention_mask = attention_mask.to(torch.float32)
+        #         q_segment_indexes = torch.ones(
+        #             batch_size, query.shape[2], device=query.device, dtype=torch.float32
+        #         )
+            
+            assert (
+                encoder_hidden_states_segment_ids.shape[1] == key.shape[2]
+            ), f"ERROR: KEY SHAPE must be same as attention mask [{key.shape[2]}, {encoder_hidden_states_segment_ids.shape[1]}]"
 
             assert (
                 query.shape[2] % 128 == 0
@@ -1050,8 +1050,8 @@ class AttnProcessor2_0:
                 q=query,
                 k=key,
                 v=value,
-                q_segment_ids=q_segment_indexes,
-                kv_segment_ids=attention_mask,
+                q_segment_ids=hidden_states_segment_ids,
+                kv_segment_ids=encoder_hidden_states_segment_ids,
                 sm_scale=attn.scale,
             )
         else:
