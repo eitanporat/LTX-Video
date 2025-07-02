@@ -150,4 +150,49 @@ def test_attention_none_vs_allones():
 
     assert torch.allclose(out_none, out_seg, atol=1e-5, rtol=1e-4)
 
+def test_attention_mask_vs_segment_ids_bool():
+    """
+    Test that the attention mask and segment ids give the same result when there is just one real segment (ID == 1).
+    """
+    torch.manual_seed(0)
+
+    B, L_q, L_k, D = 2, 20, 20, 32
+    attn = _make_attention(query_dim=D, heads=4, dim_head=8)
+
+    q  = torch.randn(B, L_q, D)
+    kv = torch.randn(B, L_k, D)
+
+    seg_q  = (torch.rand(B, L_q) > 0.3).long()   
+    seg_kv = (torch.rand(B, L_k) > 0.3).long()
+    seg_q[:, 0]  = 1                             
+    seg_kv[:, 0] = 1
+
+    out_seg = attn(
+        q,
+        freqs_cis=None,
+        encoder_hidden_states               = kv,
+        hidden_states_segment_ids           = seg_q,
+        encoder_hidden_states_segment_ids   = seg_kv,
+    )
+
+    attn_mask = torch.where(
+        seg_kv == 0,
+        torch.full_like(seg_kv, -1e9, dtype=q.dtype),
+        torch.zeros_like(seg_kv,      dtype=q.dtype),
+    ).unsqueeze(1)                                 # (B, 1, L_k)
+
+    out_mask  = attn(
+        q,
+        freqs_cis=None,
+        encoder_hidden_states = kv,
+        attention_mask        = attn_mask,
+    )
+
+    valid_rows = seg_q != 0                       # (B, L_q)
+    assert out_seg.shape == out_mask.shape
+    assert torch.allclose(
+        out_seg[valid_rows], out_mask[valid_rows],
+        atol=1e-4, rtol=1e-4
+    ), "Boolean attention_mask path differs from single-segment path"
+
 # TODO: test tpu flash attention
