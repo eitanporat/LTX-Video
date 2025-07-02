@@ -857,29 +857,25 @@ class Attention(nn.Module):
         if kv_segment_ids is None and q_segment_ids is None:
             return None
         
-        if (kv_segment_ids is None) ^ (q_segment_ids is None):
+        if (kv_segment_ids is None) != (q_segment_ids is None):
             raise ValueError("Provide both segment-ID tensors or neither.")
         
         kv_pad = kv_segment_ids == 0
         q_pad = q_segment_ids == 0
 
-        mask_bool = (
-            (q_segment_ids.unsqueeze(-1) != kv_segment_ids.unsqueeze(-1)) |
-            (q_pad.unsqueeze(-1) | kv_pad.unsqueeze(-1))
+        mask_bool = ~(
+            (q_segment_ids.unsqueeze(-1) != kv_segment_ids.unsqueeze(-2)) |
+            (q_pad.unsqueeze(-1) | kv_pad.unsqueeze(-2))
         )
 
-        # used chatgpt for this
-        additive_mask = torch.zeros_like(mask_bool, dtype=torch.float32)
-        addive_mask.masked_fill_(mask_bool, float("-inf"))
-
         if out_dim == 3:
-            additive_mask = additive_mask.repeat_interleave(H, dim=0) # B*H
-        if out_dim == 4:
-            additive_mask = additive_mask.upsqueeze(1).repeat_interleave(H, dim=1) # H is second dimension
+            mask_bool = mask_bool.repeat_interleave(head_size, dim=0) # B*H
+        elif out_dim == 4:
+            mask_bool = mask_bool.unsqueeze(1).repeat_interleave(head_size, dim=1) # H is second dimension
         else:
             raise ValueError("out_dim must be 3 or 4")
         
-        return additive_mask
+        return mask_bool
 
     def norm_encoder_hidden_states(
         self, encoder_hidden_states: torch.Tensor
@@ -979,14 +975,16 @@ class AttnProcessor2_0:
         if skip_layer_mask is not None:
             skip_layer_mask = skip_layer_mask.reshape(batch_size, 1, 1)
 
+
+        assert (encoder_hidden_states_segment_ids is None) == (hidden_states_segment_ids is None), "Either encoder_hidden_states_segment_ids and hidden_states_segment_ids are both None (for full attention) and both aren't none (for segmented attention)"
+
         attention_mask = None
 
-        assert (encoder_hidden_states_segment_ids is None) ^ (hidden_states_segment_ids is not None), "Either encoder_hidden_states_segment_ids and hidden_states_segment_ids are both None (for full attention) and both aren't none (for segmented attention)"
-
-        if encoder_hidden_states_segment_ids is not None and hidden_states_segment_ids is not None:
-            attention_mask = attn.prepare_attention_mask(
-                kv_segment_ids=encoder_hidden_states_segment_ids, q_segment_ids=hidden_states_segment_ids, target_length=sequence_length, batch_size=batch_size,
-            )
+        if not attn.use_tpu_flash_attention:
+            if encoder_hidden_states_segment_ids is not None and hidden_states_segment_ids is not None:
+                attention_mask = attn.prepare_attention_mask(
+                    kv_segment_ids=encoder_hidden_states_segment_ids, q_segment_ids=hidden_states_segment_ids, target_length=sequence_length, batch_size=batch_size, out_dim=4,
+                )
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(
@@ -1033,7 +1031,6 @@ class AttnProcessor2_0:
         #         q_segment_indexes = torch.ones(
         #             batch_size, query.shape[2], device=query.device, dtype=torch.float32
         #         )
-            
             assert (
                 encoder_hidden_states_segment_ids.shape[1] == key.shape[2]
             ), f"ERROR: KEY SHAPE must be same as attention mask [{key.shape[2]}, {encoder_hidden_states_segment_ids.shape[1]}]"
@@ -1068,6 +1065,10 @@ class AttnProcessor2_0:
             batch_size, -1, attn.heads * head_dim
         )
         hidden_states_a = hidden_states_a.to(query.dtype)
+
+        if hidden_states_segment_ids is not None:
+            pad_rows = (hidden_states_segment_ids == 0).unsqueeze(-1) 
+            hidden_states_a = hidden_states_a.masked_fill(pad_rows, 0.0)
 
         if (
             skip_layer_mask is not None
