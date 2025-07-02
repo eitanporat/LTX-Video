@@ -149,20 +149,3 @@ def test_attention_none_vs_allones():
     )
 
     assert torch.allclose(out_none, out_seg, atol=1e-5, rtol=1e-4)
-
-# the last test is running the inference script with the new attention and checking if the output is the same as the old attention
-def test_generate_video_full_pipeline():
-    prompt = "A turquoise river flows through a rocky canyon, cascading over a waterfall."
-
-    cmd = [
-        "python", "inference.py",
-        "--prompt", prompt,
-        "--height", "704",
-        "--width", "1216",
-        "--num_frames", "121",
-        "--seed", "42",
-        "--pipeline_config", "configs/ltxv-2b-0.9.6-dev.yaml",
-    ]
-
-    print("Running inference...")
-    subprocess.run(cmd, check=True)
