@@ -1,3 +1,6 @@
+import subprocess
+
+
 def generate_video_full_pipeline():
     prompt = "A turquoise river flows through a rocky canyon, cascading over a waterfall."
 
